@@ -4,6 +4,14 @@ import numpy as np
 from chess import Move
 from torch.linalg import vector_norm
 
+import sys
+
+sys.path.append("../")
+from model.backbone import TurboChessBot, ModelArgs
+
+
+# TODO: Handle if a pawn is promoted
+
 
 class chessEnv:
     def __init__(self, fen: str = chess.STARTING_FEN):
@@ -43,18 +51,6 @@ class chessEnv:
         ):
             return 7
 
-        # Left bishop
-        elif (piece_index == 11 and self.board.turn) or (
-            piece_index == 12 and not self.board.turn
-        ):
-            return 3
-
-        # Right bishop
-        elif (piece_index == 12 and self.board.turn) or (
-            piece_index == 11 and not self.board.turn
-        ):
-            return 6
-
         # Left rock
         elif (piece_index == 13 and self.board.turn) or (
             piece_index == 14 and not self.board.turn
@@ -91,19 +87,44 @@ class chessEnv:
             ).tolist()
         )
         locations = np.where(pieces == 1)[0]
+        locations = np.array([(1 + loc % 8, loc // 8 + 1) for loc in locations])
 
         # If no available piece
         if len(locations) == 0:
             return
 
-        locations = np.array([(1 + loc % 8, loc // 8 + 1) for loc in locations])
+        # Handle bishop (special case)
+        if piece_index == 11 or piece_index == 12:
+            if (piece_index == 11 and self.board.turn) or (
+                piece_index == 12 and not self.board.turn
+            ):
+                color = "black"  # black bishop
+            else:
+                color = "white"  # white bishop
 
-        dist = np.abs(locations[:, 0] - self.get_piece_column(piece_index))
+            locations_is_black = np.array(
+                [(1 + 8 * (loc[1] - 1) + loc[0] - 1) % 2 for loc in locations]
+            )
+
+            if color == "black":
+                if len(locations[np.where(locations_is_black == 1)[0]]) == 0:
+                    return
+                return locations[np.where(locations_is_black == 1)[0]][0]
+            else:
+                if len(locations[np.where(locations_is_black == 0)[0]]) == 0:
+                    return
+                return locations[np.where(locations_is_black == 0)[0]][0]
+
+        # Other pieces
+        else:
+            dist = np.abs(locations[:, 0] - self.get_piece_column(piece_index))
+
         location = locations[np.argmin(dist)]
-
         return location
 
     def make_move(self, move: torch.Tensor):
+        if len(move.shape) > 1:
+            move = move.squeeze()
         dst = np.array(
             [
                 vector_norm(move[2 * indx : 2 * indx + 2]).item()
@@ -147,6 +168,7 @@ class chessEnv:
         if move in self.board.generate_legal_moves():
             self.board.push(move)
             return True
+
         return False
 
 
@@ -155,12 +177,18 @@ if __name__ == "__main__":
     move = torch.Tensor([0.0] * 2 + [0, 0.56] + [0.56] * 2 * 14)
 
     inpt = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # Pawns
-    inpt += [1, 2, 0, 0]  # Knights
+    inpt += [0, 0, 0, 0]  # Knights
     inpt += [0, 0, 0, 0]  # Bishops
-    inpt += [0, 0, 0, 0]  # Rocks
+    inpt += [0, 2, 0, 0]  # Rocks
     inpt += [0, 0]  # Queen
     inpt += [0, 0]  # King
     move = torch.Tensor(inpt)
     # print(environment.board)
+    args = ModelArgs()
+    input = torch.ones([1, args.dim])
+
+    input = torch.ones([1, args.input_dim])
+    bot = TurboChessBot(args)
+    # move = bot(input)
     print(environment.make_move(move), "\n\n")
     print(environment.make_move(move))
