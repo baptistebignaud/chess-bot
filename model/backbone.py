@@ -9,19 +9,16 @@ from typing import Optional
 
 @dataclass
 class ModelArgs:
-    # turn +Pawns + (knight, bishop, rock) + queen + king
-    input_dim = 1 + 8 * 5 + 3 * 2 * 2 + 2 + 3
+    # turn + 2 * (Pawns + (knight, bishop, rock) + queen + king)
+    input_dim = 1 + 2 * (8 * 5 + 3 * 2 * 2 + 2 + 5)
     dim: int = 1024
     n_layers: int = 12
-    n_heads: int = 32
+    n_heads: int = 16
     n_kv_heads: Optional[int] = None
-    vocab_size: int = -1  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-
     max_batch_size: int = 32
-    max_seq_len: int = 2048
 
 
 class RMSNorm(nn.Module):
@@ -90,7 +87,7 @@ class TurboChessBot(nn.Module):
         super().__init__()
         self.l_layers = OrderedDict()
         self.input_size = args.input_dim
-        self.output_size = 2 * 16
+        self.output_size = 3 * 16
         self.l_layers["embedding"] = Linear(self.input_size, args.dim)
         for i in range(args.n_layers):
             self.l_layers[f"gpt layer {i}"] = GPTBlock(args)
@@ -99,11 +96,20 @@ class TurboChessBot(nn.Module):
         self.seq = nn.Sequential(self.l_layers)
 
     def forward(self, position: torch.Tensor) -> torch.Tensor:
-        # Position (batch_size, 2 * 2 * 16)
         output = self.seq(position)
-        output = nn.Sigmoid()(output)
-        output = 7 * output
-        # Output (batch_size, 2*16)
+
+        # Probabilities of which piece to move (batch_size, 16)
+        probs = output[:, : self.output_size // 3]
+        probs = nn.Softmax(dim=1)(probs)
+
+        # Move to do for the ith piece (batch_size, 2 * 16)
+        move = output[:, self.output_size // 3 + 1 :]
+        move = nn.Sigmoid()(move)
+        move = 14 * (
+            move - 1 / 2
+        )  # Renormalize in [-7,7]^2 that is the amplitude in chessboard
+
+        output = torch.cat([probs, move], dim=1)
         return output
 
 
