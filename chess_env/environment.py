@@ -1,188 +1,222 @@
 import chess
 import torch
 import numpy as np
-from chess import Move, BB_EMPTY
+from chess import Move, Outcome
 import random
 import sys
 from typing import Literal
-
+from gymnasium import Env
+from typing import Optional
+from chess import Termination
+from chessboard import display
+from typing import Tuple
 
 sys.path.append("../")
 from model.backbone import TurboChessBot, ModelArgs
 
+chess_mapping = {"p": 2, "n": 3, "b": 4, "r": 5, "q": 6, "k": 7}
 
-# TODO: Handle if a pawn is promoted
+
+def softmax(x, temperature: float = 1.0):
+    """Compute softmax values for each sets of scores in x."""
+    # Normalize input scores
+    x_normalized = x / temperature - np.max(x / temperature, axis=-1, keepdims=True)
+    # Calculate softmax probabilities
+    e_x = np.exp(x_normalized)
+    return e_x / np.sum(e_x, axis=-1, keepdims=True)
 
 
-class chessEnv:
+class chessEnv(Env):
     def __init__(self, fen: str = chess.STARTING_FEN):
         self.fen = fen
         self.reset()
         self.input_dim = ModelArgs().input_dim
-
-    @staticmethod
-    def get_piece_id(piece_index):
-        if piece_index <= 8:
-            return 1
-        elif piece_index <= 10:
-            return 2
-        elif piece_index <= 12:
-            return 3
-        elif piece_index <= 14:
-            return 4
-        elif piece_index == 15:
-            return 5
-        return 6
-
-    def get_piece_column(self, piece_index):
-        if piece_index <= 8 and self.board.turn:
-            return piece_index
-
-        if piece_index <= 8 and not self.board.turn:
-            return 8 - piece_index + 1
-
-        # Left knight
-        elif (piece_index == 9 and self.board.turn) or (
-            piece_index == 10 and not self.board.turn
-        ):
-            return 2
-
-        # Right knight
-        elif (piece_index == 10 and self.board.turn) or (
-            piece_index == 9 and not self.board.turn
-        ):
-            return 7
-
-        # Left rock
-        elif (piece_index == 13 and self.board.turn) or (
-            piece_index == 14 and not self.board.turn
-        ):
-            return 1
-
-        # Right rock
-        elif (piece_index == 14 and self.board.turn) or (
-            piece_index == 13 and not self.board.turn
-        ):
-            return 8
-
-        # Queen
-        elif piece_index == 15:
-            return 4
-
-        # King
-        elif piece_index == 16:
-            return 5
+        self.mapping = {"p": 2, "n": 3, "b": 4, "r": 5, "q": 6, "k": 7}
+        self.action_size = int(64 * 64)
 
     def reset(self):
         self.board = chess.Board(self.fen)
 
-    def can_castle(self, color: bool) -> (bool, bool):
+    @staticmethod
+    def can_castle(board: chess.Board, color: bool) -> Tuple[bool, bool]:
         """
         Returns a list of bool if the king cast castle king and queen side
         """
         castle = [None, None]
         if color:
             castle[0] = Move.from_uci("e1g1") in [
-                elem for elem in self.board.generate_castling_moves()
+                elem for elem in board.generate_castling_moves()
             ]
             castle[1] = Move.from_uci("e1c1") in [
-                elem for elem in self.board.generate_castling_moves()
+                elem for elem in board.generate_castling_moves()
             ]
         else:
             castle[0] = Move.from_uci("e8g8") in [
-                elem for elem in self.board.generate_castling_moves()
+                elem for elem in board.generate_castling_moves()
             ]
             castle[1] = Move.from_uci("e8c8") in [
-                elem for elem in self.board.generate_castling_moves()
+                elem for elem in board.generate_castling_moves()
             ]
         return castle
 
-    def get_model_input(self):
+    @staticmethod
+    def get_model_input(
+        board: chess.Board,
+        input_dim: int = ModelArgs().input_dim,
+    ) -> torch.IntTensor:
         """
         Prepare the input for the DL model
         """
+        # If one example is given, create a batch of (1, 8, 8, 5)
+        if len(input_dim) < 4:
+            input_dim = [1] + list(input_dim)
+        # print(input_dim)
+        model_input = np.zeros(input_dim)
+        rg = range(8)
+        # [piece_id, isyourpiece, isattacked, castleK, castleQ]
 
-        model_input = np.zeros(self.input_dim)
+        # TODO : Adapt this to have geometrical symetry to the output for black and white
+        # # If white
+        # if turn == chess.WHITE:
+        #     rg = range(8)
+        # else:
+        #     rg = range(7, -1, 1)
 
-        ###### Kings
+        for rank in rg:
+            for nb in rg:
+                castles = [0, 0]
+                square = rank * 8 + nb
+                piece = board.piece_at(square)
+                if piece is None:
+                    model_input[0, nb, rank, :] = [1, 0, 0] + castles
+                    continue
 
-        # White caslting
-        indx = 1 + (self.input_dim - 1) // 2
-        model_input[indx - 3 : indx - 1] = self.can_castle(color=chess.WHITE)
+                iswhite = piece.color
+                symbol = piece.symbol().lower()
+                piece_id = chess_mapping[symbol]
 
-        # White king is checked (cf. https://python-chess.readthedocs.io/en/latest/_modules/chess.html#Board.is_checkmate) is_check function
-        king = self.board.king(chess.WHITE)
-        model_input[indx] = bool(
-            BB_EMPTY
-            if king is None
-            else self.board.attackers_mask(not chess.WHITE, king)
-        )
+                if piece_id == 7:
+                    castles = chessEnv.can_castle(board=board, color=iswhite)
 
-        # Black caslting
-        model_input[-3:-1] = self.can_castle(color=chess.BLACK)
-        # Black king is checked
-        king = self.board.king(chess.BLACK)
-        model_input[-1] = bool(
-            BB_EMPTY
-            if king is None
-            else self.board.attackers_mask(not chess.BLACK, king)
-        )
+                if board.turn == piece.color:
+                    isyourpiece = 1
+                else:
+                    isyourpiece = -1
+                isattacked = board.is_attacked_by((not board.turn), square)
 
-        return torch.Tensor(model_input)
+                model_input[0, nb, rank, :] = [
+                    piece_id,
+                    isyourpiece,
+                    isattacked,
+                ] + castles
 
-    def find_closest_piece(self, piece_index: int):
-        """
-        Find closer pawn to the output of DL model
-        Args:
-            piece_index: 1:8 -> Pawn || 9:10 -> Knight || 11:12 -> Bishop || 13:14 -> Rock || 15 -> Queen || 16 -> King
-        """
-        # Get available pieces on the board
-        pieces = np.array(
-            self.board.pieces(
-                chessEnv.get_piece_id(piece_index), self.board.turn
-            ).tolist()
-        )
-        locations = np.where(pieces == 1)[0]
-        locations = np.array([(1 + loc % 8, loc // 8 + 1) for loc in locations])
+        return torch.IntTensor(model_input)
 
-        # If no available piece
-        if len(locations) == 0:
-            return
+    @staticmethod
+    def get_reward(
+        color: chess.WHITE | chess.BLACK,
+        outcome: Optional[Outcome] = None,
+    ):
+        # Outcome of the game
+        if outcome is not None:
+            winner = outcome.winner
+            # Draw (penalize a bit draw)
+            if winner is None:
+                return -0.25
+            if color != winner:
+                return -1
+            return 1
+        # else:
+        #     board_fen = board.board_fen()
+        #     p, P = board_fen.count("p"), board_fen.count("P")
+        #     n, N = board_fen.count("n"), board_fen.count("N")
+        #     b, B = board_fen.count("b"), board_fen.count("B")
+        #     r, R = board_fen.count("r"), board_fen.count("R")
+        #     q, Q = board_fen.count("q"), board_fen.count("Q")
+        #     reward_material = P - p + (N + B - b - n) * 3 + (R - r) * 5 + (Q - q) * 10
+        #     if color == chess.BLACK:
+        #         reward_material *= -1
 
-        # Handle bishop (special case)
-        if piece_index == 11 or piece_index == 12:
-            if (piece_index == 11 and self.board.turn) or (
-                piece_index == 12 and not self.board.turn
-            ):
-                color = "black"  # black bishop
-            else:
-                color = "white"  # white bishop
+        #     reward = reward_material
+        #     return reward
 
-            locations_is_black = np.array(
-                [(1 + 8 * (loc[1] - 1) + loc[0] - 1) % 2 for loc in locations]
-            )
+    def step(self, action: Move) -> Optional[Outcome]:
+        self.board.push(action)
+        outcome = self.board.outcome()
+        # if outcome is not None:
+        #     self.reset()
+        return outcome
 
-            if color == "black":
-                if len(locations[np.where(locations_is_black == 1)[0]]) == 0:
-                    return
-                return locations[np.where(locations_is_black == 1)[0]][0]
-            else:
-                if len(locations[np.where(locations_is_black == 0)[0]]) == 0:
-                    return
-                return locations[np.where(locations_is_black == 0)[0]][0]
+    def getActionSize(self):
+        return self.action_size
 
-        # Other pieces
+    @staticmethod
+    def get_id_from_position(position: Tuple[str, str]):
+        incr_to_num = ord("a")
+        id_origin = 8 * (ord(position[0][0]) - incr_to_num) + int(position[0][1]) - 1
+        id_origin *= 64
+        id_final = 8 * (ord(position[1][0]) - incr_to_num) + int(position[1][1]) - 1
+        return id_origin + id_final
+
+    @staticmethod
+    def get_legal_moves(board: chess.Board):
+        legal_moves = [str(elem) for elem in board.generate_legal_moves()]
+        legal_moves = [[move[:2], move[2:]] for move in legal_moves]
+        legal_moves = [chessEnv.get_id_from_position(move) for move in legal_moves]
+        return legal_moves
+
+    @staticmethod
+    def legal_moves_to_inputs(legal_moves: list[int], action_size: int) -> np.array:
+        vect = np.zeros(action_size)
+        for mov in legal_moves:
+            vect[mov] = 1
+        return vect
+
+    @staticmethod
+    def filter_valid_moves(board: chess.Board, output: torch.Tensor):
+        if len(output.shape) >= 1:
+            output = output.squeeze()
+        legal_moves = chessEnv.get_legal_moves(board)
+
+        mask = np.zeros(output.shape)
+        mask[legal_moves] = 1
+        output = output * mask
+
+        # No legal moves provided
+        if (output.sum() == 0) or (len(np.where(output > 0)[0]) <= 1):
+            output = mask
+            output /= output.sum()
+
         else:
-            dist = np.abs(locations[:, 0] - self.get_piece_column(piece_index))
+            # Rescale
+            output[legal_moves] = output[legal_moves] / output[legal_moves].sum()
 
-        location = locations[np.argmin(dist)]
-        return location
+        if output.sum() == 0:
+            output = mask
+            output /= output.sum()
 
+        return output
+
+    @staticmethod
+    def get_position_from_id(id: int):
+        initial_pos = id // 64
+        future_pos = id % 64
+
+        rank_i = chr(65 + initial_pos // 8).lower()
+        nb_i = str(1 + initial_pos % 8)
+
+        rank_f = chr(65 + future_pos // 8).lower()
+        nb_f = str(1 + future_pos % 8)
+
+        move = rank_i + nb_i + rank_f + nb_f
+        return move
+
+    @staticmethod
     def make_move(
-        self,
+        board: chess.Board,
         output: np.array,
         sampling_stategy: Literal["greedy", "sampling"] = "sampling",
-    ) -> bool:
+    ) -> chess.Board:
         """
         Make move having the output of the DL model
         It samples the piece to move, then get the movement to do. If the move is legit, it does it and returns True
@@ -194,84 +228,51 @@ class chessEnv:
         Returns:
             bool
         """
-        # print(self.board.has_kingside_castling_rights(self.board.turn))
-        # print(self.board.has_queenside_castling_rights(self.board.turn))
         if len(output.shape) > 1:
             output = output.squeeze()
 
-        probs = output[: len(output) // 3]
-        move = output[len(output) // 3 :]
+        # For black reverse the outcome so that it is invariant
+        if board.turn == chess.BLACK:
+            output = output[::-1]
+        output = chessEnv.filter_valid_moves(board, output)
 
         # Get piece to move
         if sampling_stategy == "sampling":
-            piece_index = random.choices(np.arange(len(probs)), probs, k=1)[0]
+            piece_index = random.choices(np.arange(len(output)), output, k=1)[0]
         else:
-            piece_index = probs.argmax()
+            piece_index = output.argmax()
 
-        # Get move to do
-        move = move[2 * piece_index : 2 * piece_index + 2].round()
+        move = chessEnv.get_position_from_id(piece_index)
+        return move
 
-        # Find closest piece to do the move
-        piece = self.find_closest_piece(piece_index + 1)
+    def play_game(self, playerW=None, playerB=None):
+        valid_fen = "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2"
 
-        if piece is None:
-            return False
+        game_board = display.start()
 
-        # White to move
-        if self.board.turn:
-            move = (
-                chr(int(65 + piece[0] - 1)).lower()
-                + str(int(piece[1]))
-                + chr(int(65 + piece[0] + move[0] - 1)).lower()
-                + str(int(piece[1] + move[1]))
-            )
+        while True:
+            display.check_for_quit()
+            display.update(valid_fen, game_board)
 
-        # Black to move
-        else:
-            move = (
-                chr(int(65 + piece[0] - 1)).lower()
-                + str(int(piece[1]))
-                + chr(int(65 + piece[0] - move[0]) - 1).lower()
-                + str(int(piece[1] - move[1]))
-            )
-        print("move", move)
-
-        try:
-            move = Move.from_uci(move)
-        except chess.InvalidMoveError:
-            return False
-        if move in self.board.generate_legal_moves():
-            self.board.push(move)
-            return True
-
-        return False
+            # board flip interface
+            if not game_board.flipped:
+                display.flip(game_board)
 
 
 if __name__ == "__main__":
     environment = chessEnv()
-    move = torch.Tensor([0.0] * 2 + [0, 0.56] + [0.56] * 2 * 14)
-    move = [0.9, 0.1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # Probabilities
-    move += [0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # Pawns
-    move += [0, 0, 0, 0]  # Knights
-    move += [0, 0, 0, 0]  # Bishops
-    move += [0, 0, 0, 0]  # Rocks
-    move += [0, 0]  # Queen
-    move += [0, 0]  # King
-    move = torch.Tensor(move)
     # print(environment.board)
     args = ModelArgs()
-    input = torch.ones([1, args.dim])
+    dims = [1] + list(args.input_dim)
+    input = torch.ones(*dims, dtype=torch.int32)
 
-    input = torch.ones([1, args.input_dim])
     bot = TurboChessBot(args)
 
-    move = bot(input).detach()
-
+    # environment.make_move(move)
+    # print(move.shape)
     # print(move)
-
-    print(environment.make_move(move.numpy()), "\n\n")
-    print(environment.make_move(move.numpy()))
-    print(environment.get_model_input())
+    print(environment.play_game())
+    exit()
 
     board = chess.Board()
     board.push_san("e4")

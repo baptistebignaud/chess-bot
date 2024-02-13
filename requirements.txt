@@ -1,3 +1,5 @@
 torch
 chess
 numpy
+tqdm
+chess-board
